@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Peddlo</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.js"></script>
+<style>
+  :root { --green:#2e7d32; --bg:#f4f7f2; --card:#ffffff; --text:#1d2b1f; --muted:#667568; --line:#dfe6dc; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, "Segoe UI", sans-serif; background:var(--bg); color:var(--text); }
+  header { background:var(--green); color:#fff; padding:12px 16px; display:flex; justify-content:space-between; align-items:center; }
+  header h1 { margin:0; font-size:1.3rem; letter-spacing:.5px; }
+  header small { opacity:.85; display:block; font-size:.75rem; }
+  main { max-width:760px; margin:0 auto; padding:10px 12px 40px; }
+  .card { background:var(--card); border-radius:12px; padding:14px; margin:12px 0; box-shadow:0 1px 4px #0002; }
+  .card h2 { margin:0 0 10px; font-size:1.05rem; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:6px 0; }
+  input, select { padding:9px; border:1px solid var(--line); border-radius:8px; font-size:.95rem; flex:1 1 110px; min-width:0; }
+  button { background:var(--green); color:#fff; border:0; border-radius:8px; padding:9px 14px; font-size:.9rem; cursor:pointer; }
+  button.ghost { background:#fff; color:var(--green); border:1px solid var(--green); }
+  button.danger { background:#c62828; }
+  .item { border-top:1px solid var(--line); padding:10px 0; }
+  .item:first-of-type { border-top:0; }
+  .muted { color:var(--muted); font-size:.85rem; }
+  .tag { display:inline-block; padding:2px 8px; border-radius:10px; font-size:.75rem; background:#e8f5e9; color:var(--green); }
+  .tag.cancelled { background:#fdecea; color:#c62828; }
+  .tag.done, .tag.delivered, .tag.completed { background:#e3f2fd; color:#1565c0; }
+  .tabs { display:flex; gap:6px; margin:8px 0; }
+  .tabs button { flex:1; }
+  #map { height:320px; border-radius:10px; margin:10px 0; position:relative; z-index:0; background:#e8eee6; }
+  .numpin { width:28px; height:28px; border-radius:50%; background:var(--green); color:#fff; font-weight:700; display:flex; align-items:center; justify-content:center; border:2px solid #fff; box-shadow:0 1px 4px #0006; }
+  #toast { z-index:2000; position:fixed; bottom:16px; left:50%; transform:translateX(-50%); background:#222; color:#fff; padding:10px 16px; border-radius:8px; display:none; max-width:90%; }
+</style>
+</head>
+<body>
+<header>
+  <div><h1>PEDDLO</h1><small>Fresh to your floor, on your schedule</small></div>
+  <div id="who"></div>
+</header>
+<main id="app"></main>
+<div id="toast"></div>
+
+<script>
+const $ = (s) => document.querySelector(s);
+let me = JSON.parse(localStorage.getItem("peddlo_user") || "null");
+let stopProducts = {};
+let geo = JSON.parse(localStorage.getItem("peddlo_geo") || "null"); // customer's chosen location
+let demo = null;    // demo location from the server
+let onGeo = null;   // what to refresh when the location changes
+let stopGeo = null; // location picked for a new hawker stop
+let mode = "society";
+
+function esc(v) {
+  return String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+function fmt(iso) {
+  return new Date(iso).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+}
+function toast(msg) {
+  const t = $("#toast");
+  t.textContent = msg;
+  t.style.display = "block";
+  setTimeout(() => (t.style.display = "none"), 3000);
+}
+async function api(path, method = "GET", body) {
+  const res = await fetch(path, {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const d = data.detail;
+    throw new Error(typeof d === "string" ? d : JSON.stringify(d || "Something went wrong"));
+  }
+  return data;
+}
+// run a handler, show errors as a toast
+async function run(fn) {
+  try { await fn(); } catch (e) { toast(e.message); }
+}
+const val = (id) => document.getElementById(id).value.trim();
+
+/* ---------------- location helpers ---------------- */
+function getGps() {
+  return new Promise((resolve, reject) => {
+    if (!navigator.geolocation) return reject(new Error("This browser cannot share location"));
+    navigator.geolocation.getCurrentPosition(
+      (p) => resolve({ lat: p.coords.latitude, lng: p.coords.longitude }),
+      () => reject(new Error("Could not get your location. Allow location access, or use the demo location.")),
+      { enableHighAccuracy: true, timeout: 10000 }
+    );
+  });
+}
+function mapLink(lat, lng) { return `https://www.google.com/maps?q=${lat},${lng}`; }
+function geoText() {
+  return geo
+    ? `📍 Using ${esc(geo.label)} (${geo.lat.toFixed(4)}, ${geo.lng.toFixed(4)})`
+    : "Location not set. Tap a location button to find hawkers near you.";
+}
+function saveGeo(g, label) {
+  geo = { lat: g.lat, lng: g.lng, label };
+  localStorage.setItem("peddlo_geo", JSON.stringify(geo));
+}
+async function afterGeo() {
+  const el = document.getElementById("geoinfo");
+  if (el) el.innerHTML = geoText();
+  if (onGeo) await onGeo();
+}
+async function useGps() { saveGeo(await getGps(), "your location"); mode = "nearby"; await afterGeo(); }
+async function useDemo() {
+  if (!demo) throw new Error("Demo location not available");
+  saveGeo(demo, "demo location"); mode = "nearby"; await afterGeo();
+}
+
+/* ---------------- map helpers (Leaflet + OpenStreetMap) ---------------- */
+let map = null;
+let markers = {};
+let stopPin = null;
+
+function emojiIcon(emoji, size = 34) {
+  return L.divIcon({
+    html: `<div style="font-size:${size - 8}px;line-height:${size}px;text-align:center;filter:drop-shadow(0 1px 2px #0006)">${emoji}</div>`,
+    className: "", iconSize: [size, size], iconAnchor: [size / 2, size / 2], popupAnchor: [0, -size / 2],
+  });
+}
+function numberIcon(n) {
+  return L.divIcon({ html: `<div class="numpin">${n}</div>`, className: "", iconSize: [28, 28], iconAnchor: [14, 14], popupAnchor: [0, -14] });
+}
+// create a fresh map inside <div id="map">
+function newMap(center, zoom) {
+  const el = document.getElementById("map");
+  if (!el) return null;
+  if (typeof L === "undefined") {
+    el.innerHTML = '<p class="muted" style="padding:12px">The map needs an internet connection.</p>';
+    return null;
+  }
+  try { if (map) map.remove(); } catch (e) { /* old map's element is already gone */ }
+  markers = {};
+  stopPin = null;
+  map = L.map(el).setView([center.lat, center.lng], zoom);
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19, attribution: "© OpenStreetMap contributors",
+  }).addTo(map);
+  return map;
+}
+// customer maps: items = [{key, lat, lng, icon, html}], radiusKm draws a circle around "me"
+function drawMap(items, radiusKm) {
+  const center = geo || demo || { lat: 28.7041, lng: 77.1025 };
+  if (!newMap(center, 14)) return;
+  const pts = [];
+  if (geo) {
+    L.marker([geo.lat, geo.lng], { icon: emojiIcon("🧍", 38), zIndexOffset: 1000 }).addTo(map).bindPopup("You are here");
+  }
+  items.filter((i) => i.lat != null).forEach((i) => {
+    markers[i.key] = L.marker([i.lat, i.lng], { icon: emojiIcon(i.icon) }).addTo(map).bindPopup(i.html);
+    pts.push([i.lat, i.lng]);
+  });
+  if (geo && radiusKm) {
+    const circle = L.circle([geo.lat, geo.lng], { radius: radiusKm * 1000, color: "#2e7d32", weight: 1, fillOpacity: 0.06 }).addTo(map);
+    map.fitBounds(circle.getBounds());
+  } else if (pts.length) {
+    map.fitBounds(pts, { padding: [30, 30], maxZoom: 16 });
+  }
+  // tapping empty map moves "my location" there (handy for demos)
+  map.on("click", (e) => {
+    setTimeout(() => run(async () => {
+      saveGeo({ lat: e.latlng.lat, lng: e.latlng.lng }, "a pin you dropped");
+      mode = "nearby";
+      await afterGeo();
+    }), 0);
+  });
+}
+// hawker map: numbered stops joined by a dashed route line; tap the map to choose a new stop's location
+function drawRouteMap(stops) {
+  const withGps = stops.filter((s) => s.lat != null).sort((a, b) => a.sequence - b.sequence);
+  const center = withGps[0] || demo || { lat: 28.7041, lng: 77.1025 };
+  if (!newMap(center, 14)) return;
+  const pts = [];
+  withGps.forEach((s) => {
+    L.marker([s.lat, s.lng], { icon: numberIcon(s.sequence) }).addTo(map)
+      .bindPopup(`<b>#${s.sequence} ${esc(s.society)}</b><br>${fmt(s.eta)}<br>${esc(s.status)}`);
+    pts.push([s.lat, s.lng]);
+  });
+  if (pts.length > 1) L.polyline(pts, { color: "#2e7d32", weight: 3, dashArray: "6 6" }).addTo(map);
+  if (pts.length) map.fitBounds(pts, { padding: [30, 30], maxZoom: 16 });
+  map.on("click", (e) => { stopGeo = { lat: e.latlng.lat, lng: e.latlng.lng }; dropStopPin(false); });
+}
+function dropStopPin(pan) {
+  if (!map || !stopGeo) return;
+  if (stopPin) map.removeLayer(stopPin);
+  stopPin = L.marker([stopGeo.lat, stopGeo.lng], { icon: emojiIcon("📌") }).addTo(map).bindPopup("New stop location").openPopup();
+  if (pan) map.setView([stopGeo.lat, stopGeo.lng], 16);
+  const el = document.getElementById("stopgeo");
+  if (el) el.textContent = `Location set: ${stopGeo.lat.toFixed(4)}, ${stopGeo.lng.toFixed(4)}`;
+}
+function focusMarker(key) {
+  const m = markers[key];
+  if (!m || !map) return;
+  map.flyTo(m.getLatLng(), Math.max(map.getZoom(), 16));
+  m.openPopup();
+  document.getElementById("map").scrollIntoView({ behavior: "smooth", block: "center" });
+}
+function focusEl(id) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.scrollIntoView({ behavior: "smooth", block: "center" });
+  el.style.background = "#e8f5e9";
+  setTimeout(() => (el.style.background = ""), 1500);
+}
+
+/* ---------------- login ---------------- */
+function renderLogin() {
+  $("#who").innerHTML = "";
+  $("#app").innerHTML = `
+    <section class="card">
+      <h2>Welcome to Peddlo</h2>
+      <p class="muted">Enter your phone number. New here? Fill in the rest to register.</p>
+      <div class="row"><input id="lp" placeholder="Phone number" inputmode="tel"></div>
+      <div class="row"><input id="ln" placeholder="Your name (new users)"></div>
+      <div class="row">
+        <select id="lr">
+          <option value="customer">I want to order / hire</option>
+          <option value="hawker">I am a hawker (fruits &amp; veggies)</option>
+          <option value="gig">I am a gig worker</option>
+        </select>
+        <input id="ls" placeholder="Society / area">
+      </div>
+      <div class="row"><button onclick="run(login)">Continue</button></div>
+    </section>`;
+}
+async function login() {
+  const phone = val("lp");
+  if (phone.length < 7) throw new Error("Enter a valid phone number");
+  try {
+    me = await api(`/users/by-phone/${encodeURIComponent(phone)}`);
+  } catch (e) {
+    const name = val("ln");
+    if (!name) throw new Error("New user: please enter your name");
+    me = await api("/users", "POST", { name, phone, role: val("lr"), society: val("ls") || null });
+  }
+  localStorage.setItem("peddlo_user", JSON.stringify(me));
+  start();
+}
+function logout() {
+  localStorage.removeItem("peddlo_user");
+  me = null;
+  start();
+}
+
+/* ---------------- hawker ---------------- */
+async function renderHawker() {
+  const [products, stops] = await Promise.all([
+    api(`/hawkers/${me.id}/products`),
+    api(`/hawkers/${me.id}/stops`),
+  ]);
+  $("#app").innerHTML = `
+    <section class="card">
+      <h2>My products</h2>
+      <div class="row">
+        <input id="pn" placeholder="Name (Tomato)">
+        <input id="pu" placeholder="Unit" value="kg" style="max-width:80px">
+        <input id="pp" type="number" placeholder="Price ₹">
+        <input id="ps" type="number" placeholder="Stock">
+        <button onclick="run(addProduct)">Add</button>
+      </div>
+      ${products.map((p) => `<div class="item"><b>${esc(p.name)}</b> — ₹${p.price}/${esc(p.unit)} <span class="muted">(stock: ${p.stock} ${esc(p.unit)})</span></div>`).join("") || '<p class="muted">No products yet.</p>'}
+    </section>
+
+    <section class="card">
+      <h2>My route</h2>
+      <div class="row">
+        <input id="ss" placeholder="Society / stop">
+        <input id="sq" type="number" min="1" placeholder="Stop #" style="max-width:90px">
+        <input id="se" type="datetime-local">
+        <button onclick="run(addStop)">Add stop</button>
+      </div>
+      <div class="row">
+        <button class="ghost" onclick="run(() => setStopGeo(false))">📍 Use my current location</button>
+        <button class="ghost" onclick="run(() => setStopGeo(true))">Use demo location</button>
+        <span class="muted" id="stopgeo">${stopGeo ? "Location set for the next stop" : "No location set for this stop"}</span>
+      </div>
+      <div id="map"></div>
+      <p class="muted">Tap the map to choose where the new stop is. Numbered pins show your route.</p>
+      ${stops.map((s) => `
+        <div class="item">
+          <b>#${s.sequence} ${esc(s.society)}</b> <span class="tag ${s.status}">${s.status}</span><br>
+          <span class="muted">Arrives: ${fmt(s.eta)}</span>${s.lat != null ? ` · <a href="${mapLink(s.lat, s.lng)}" target="_blank" rel="noopener">📍 map</a>` : ""}
+          <div class="row">
+            <input id="eta${s.id}" type="datetime-local">
+            <button class="ghost" onclick="run(() => changeEta(${s.id}))">Update ETA</button>
+          </div>
+          <div class="row">
+            <button class="ghost" onclick="run(() => setStop(${s.id},'arrived'))">Arrived</button>
+            <button class="ghost" onclick="run(() => setStop(${s.id},'done'))">Done</button>
+            <button class="danger" onclick="run(() => setStop(${s.id},'cancelled'))">Cancel</button>
+            <button onclick="run(() => showPacking(${s.id}))">Packing list</button>
+          </div>
+          <div id="pk${s.id}"></div>
+        </div>`).join("") || '<p class="muted">No stops yet. Add your first stop above.</p>'}
+    </section>`;
+  drawRouteMap(stops);
+}
+async function addProduct() {
+  await api(`/hawkers/${me.id}/products`, "POST", {
+    name: val("pn"), unit: val("pu") || "kg", price: parseFloat(val("pp")), stock: parseFloat(val("ps")),
+  });
+  renderHawker();
+}
+async function addStop() {
+  if (!val("se")) throw new Error("Pick an arrival time");
+  await api(`/hawkers/${me.id}/stops`, "POST", {
+    society: val("ss"), sequence: parseInt(val("sq") || "1", 10), eta: val("se"),
+    lat: stopGeo ? stopGeo.lat : null, lng: stopGeo ? stopGeo.lng : null,
+  });
+  stopGeo = null;
+  renderHawker();
+}
+async function setStopGeo(useDemoLoc) {
+  if (useDemoLoc && !demo) throw new Error("Demo location not available");
+  stopGeo = useDemoLoc ? { lat: demo.lat, lng: demo.lng } : await getGps();
+  dropStopPin(true);
+}
+async function changeEta(id) {
+  if (!val("eta" + id)) throw new Error("Pick the new time first");
+  await api(`/stops/${id}/eta`, "PATCH", { eta: val("eta" + id) });
+  renderHawker();
+}
+async function setStop(id, status) {
+  await api(`/stops/${id}/status`, "PATCH", { status });
+  renderHawker();
+}
+async function showPacking(id) {
+  const data = await api(`/stops/${id}/packing-list`);
+  $("#pk" + id).innerHTML = data.items.length
+    ? "<ul>" + data.items.map((i) => `<li>${esc(i.name)}: <b>${i.total_qty} ${esc(i.unit)}</b> (${i.orders} orders)</li>`).join("") + "</ul>"
+    : '<p class="muted">No orders for this stop yet.</p>';
+}
+
+/* ---------------- customer ---------------- */
+async function renderCustomer() {
+  onGeo = loadStops;
+  mode = geo ? "nearby" : "society";
+  $("#app").innerHTML = `
+    <div class="tabs">
+      <button onclick="run(renderCustomer)">Fresh produce</button>
+      <button class="ghost" onclick="run(renderGigSearch)">Hire help</button>
+    </div>
+    <section class="card">
+      <h2>Hawkers coming to you</h2>
+      <div class="row">
+        <button onclick="run(useGps)">📍 Use my location</button>
+        <button class="ghost" onclick="run(useDemo)">Use demo location</button>
+        <select id="rad" onchange="run(loadStops)">
+          <option value="1">within 1 km</option>
+          <option value="3" selected>within 3 km</option>
+          <option value="5">within 5 km</option>
+          <option value="10">within 10 km</option>
+        </select>
+      </div>
+      <p class="muted" id="geoinfo">${geoText()}</p>
+      <div id="map"></div>
+      <p class="muted">🥬 hawker stop · 🧍 you · tap an empty spot on the map to move your location</p>
+      <div class="row">
+        <input id="soc" placeholder="...or search by society" value="${esc(me.society || "")}">
+        <button class="ghost" onclick="run(searchSociety)">Search society</button>
+      </div>
+      <div id="stops"></div>
+    </section>
+    <section class="card"><h2>My orders</h2><div id="orders"></div></section>`;
+  await Promise.all([loadStops(), loadOrders()]);
+}
+async function searchSociety() { mode = "society"; await loadStops(); }
+async function loadStops() {
+  let stops;
+  if (mode === "nearby" && geo) {
+    const r = document.getElementById("rad").value;
+    stops = await api(`/stops/nearby?lat=${geo.lat}&lng=${geo.lng}&radius_km=${r}`);
+  } else {
+    const soc = document.getElementById("soc").value.trim();
+    stops = await api("/stops" + (soc ? `?society=${encodeURIComponent(soc)}` : ""));
+  }
+  const lists = await Promise.all(stops.map((s) => api(`/hawkers/${s.hawker_id}/products`)));
+  stops.forEach((s, i) => (stopProducts[s.id] = lists[i]));
+  $("#stops").innerHTML = stops.map((s) => `
+    <div class="item" id="stop${s.id}">
+      <b>${esc(s.hawker_name)}</b> at ${esc(s.society)}${s.distance_km != null ? ` · <b>${s.distance_km} km away</b>` : ""}
+      — <span class="muted">${fmt(s.eta)}</span> <span class="tag">${s.status}</span>
+      ${s.lat != null ? `<a href="#" onclick="focusMarker('s${s.id}');return false;">📍 show on map</a>` : ""}
+      ${stopProducts[s.id].map((p) => `
+        <div class="row">
+          <span style="flex:2 1 140px">${esc(p.name)} ₹${p.price}/${esc(p.unit)} <span class="muted">(${p.stock} left)</span></span>
+          <input id="q${s.id}_${p.id}" type="number" min="0" step="0.5" placeholder="Qty">
+        </div>`).join("") || '<p class="muted">No products listed.</p>'}
+      ${s.status === "scheduled" ? `<button onclick="run(() => placeOrder(${s.id}))">Place pre-order</button>` : '<span class="muted">Orders closed</span>'}
+    </div>`).join("") || '<p class="muted">No hawkers found here right now. Try a bigger radius or the demo location.</p>';
+  drawMap(
+    stops.map((s) => ({
+      key: "s" + s.id, lat: s.lat, lng: s.lng, icon: "🥬",
+      html: `<b>${esc(s.hawker_name)}</b><br>${esc(s.society)}<br>${fmt(s.eta)}${s.distance_km != null ? `<br>${s.distance_km} km away` : ""}<br><a href="#" onclick="focusEl('stop${s.id}');return false;">Order below ↓</a>`,
+    })),
+    mode === "nearby" && geo ? parseFloat(document.getElementById("rad").value) : null
+  );
+}
+async function placeOrder(stopId) {
+  const items = [];
+  stopProducts[stopId].forEach((p) => {
+    const q = parseFloat(document.getElementById(`q${stopId}_${p.id}`).value);
+    if (q > 0) items.push({ product_id: p.id, qty: q });
+  });
+  if (!items.length) throw new Error("Enter a quantity for at least one item");
+  const r = await api("/orders", "POST", { customer_id: me.id, stop_id: stopId, items });
+  toast(`Order placed! Total ₹${r.total}`);
+  renderCustomer();
+}
+async function loadOrders() {
+  const orders = await api(`/customers/${me.id}/orders`);
+  $("#orders").innerHTML = orders.map((o) => `
+    <div class="item">
+      Order #${o.id} — ₹${o.total} <span class="tag ${o.status}">${o.status}</span><br>
+      <span class="muted">${esc(o.society)} · arrives ${fmt(o.eta)}</span>
+      ${["placed", "accepted"].includes(o.status) ? `<div class="row"><button class="danger" onclick="run(() => cancelOrder(${o.id}))">Cancel</button></div>` : ""}
+    </div>`).join("") || '<p class="muted">No orders yet.</p>';
+}
+async function cancelOrder(id) {
+  await api(`/orders/${id}/status`, "PATCH", { status: "cancelled" });
+  renderCustomer();
+}
+
+/* ---------------- gig: search + book (customer) ---------------- */
+async function renderGigSearch() {
+  onGeo = searchGig;
+  $("#app").innerHTML = `
+    <div class="tabs">
+      <button class="ghost" onclick="run(renderCustomer)">Fresh produce</button>
+      <button onclick="run(renderGigSearch)">Hire help</button>
+    </div>
+    <section class="card">
+      <h2>Find local help</h2>
+      <div class="row">
+        <button onclick="run(useGps)">📍 Use my location</button>
+        <button class="ghost" onclick="run(useDemo)">Use demo location</button>
+        <select id="grad" onchange="run(searchGig)">
+          <option value="2">within 2 km</option>
+          <option value="5" selected>within 5 km</option>
+          <option value="10">within 10 km</option>
+          <option value="30">within 30 km</option>
+        </select>
+      </div>
+      <p class="muted" id="geoinfo">${geoText()}</p>
+      <div id="map"></div>
+      <p class="muted">🔧 gig worker · 🧍 you · tap an empty spot on the map to move your location</p>
+      <div class="row">
+        <input id="gs" placeholder="Skill (plumber, electrician, cook...)">
+        <button onclick="run(searchGig)">Search</button>
+      </div>
+      <div id="gigres"></div>
+    </section>`;
+  await searchGig();
+}
+async function searchGig() {
+  const skill = document.getElementById("gs").value.trim();
+  const q = new URLSearchParams();
+  if (skill) q.set("skill", skill);
+  let list;
+  if (geo) {
+    q.set("lat", geo.lat); q.set("lng", geo.lng); q.set("radius_km", document.getElementById("grad").value);
+    list = await api("/gig/nearby?" + q.toString());
+  } else {
+    list = await api("/gig/services" + (skill ? "?" + q.toString() : ""));
+  }
+  $("#gigres").innerHTML = list.map((g) => `
+    <div class="item" id="gig${g.id}">
+      <b>${esc(g.worker_name)}</b> — ${esc(g.skill)} · ₹${g.rate} ${esc(g.rate_unit.replace("_", " "))}
+      ${g.distance_km != null ? ` · <b>${g.distance_km} km away</b>` : ""}
+      ${g.lat != null ? `<a href="#" onclick="focusMarker('g${g.id}');return false;">📍 show on map</a>` : ""}
+      <div class="row">
+        <input id="bk${g.id}" type="datetime-local">
+        <input id="bn${g.id}" placeholder="Note (optional)">
+        <button onclick="run(() => bookGig(${g.id}))">Book</button>
+      </div>
+    </div>`).join("") || '<p class="muted">No workers found. Try a bigger radius or the demo location.</p>';
+  drawMap(
+    list.map((g) => ({
+      key: "g" + g.id, lat: g.lat, lng: g.lng, icon: "🔧",
+      html: `<b>${esc(g.worker_name)}</b><br>${esc(g.skill)} · ₹${g.rate}${g.distance_km != null ? `<br>${g.distance_km} km away` : ""}<br><a href="#" onclick="focusEl('gig${g.id}');return false;">Book below ↓</a>`,
+    })),
+    geo ? parseFloat(document.getElementById("grad").value) : null
+  );
+}
+async function bookGig(serviceId) {
+  const when = val("bk" + serviceId);
+  if (!when) throw new Error("Pick a date and time");
+  await api("/bookings", "POST", {
+    customer_id: me.id, service_id: serviceId, scheduled_for: when, note: val("bn" + serviceId) || null,
+  });
+  toast("Booking requested!");
+}
+
+/* ---------------- gig worker ---------------- */
+async function renderGigWorker() {
+  const [all, bookings] = await Promise.all([api("/gig/services"), api(`/gig/${me.id}/bookings`)]);
+  const mine = all.filter((g) => g.worker_id === me.id);
+  $("#app").innerHTML = `
+    <section class="card">
+      <h2>My location</h2>
+      <p class="muted">${me.lat != null ? `Set: ${me.lat.toFixed(4)}, ${me.lng.toFixed(4)}` : "Not set. Customers cannot find you nearby until you set it."}</p>
+      <div class="row">
+        <button onclick="run(() => setMyLocation(false))">📍 Use my current location</button>
+        <button class="ghost" onclick="run(() => setMyLocation(true))">Use demo location</button>
+      </div>
+    </section>
+    <section class="card">
+      <h2>My services</h2>
+      <div class="row">
+        <input id="gk" placeholder="Skill (Plumber)">
+        <input id="gr" type="number" placeholder="Rate ₹">
+        <select id="gu"><option value="per_hour">per hour</option><option value="per_day">per day</option><option value="per_job">per job</option></select>
+        <button onclick="run(addService)">Add</button>
+      </div>
+      ${mine.map((g) => `<div class="item"><b>${esc(g.skill)}</b> — ₹${g.rate} ${esc(g.rate_unit.replace("_", " "))}</div>`).join("") || '<p class="muted">No services listed yet.</p>'}
+    </section>
+    <section class="card">
+      <h2>Booking requests</h2>
+      ${bookings.map((b) => `
+        <div class="item">
+          <b>${esc(b.customer_name)}</b> · ${esc(b.skill)} <span class="tag ${b.status}">${b.status}</span><br>
+          <span class="muted">${fmt(b.scheduled_for)}${b.note ? " · " + esc(b.note) : ""}</span>
+          <div class="row">
+            <button class="ghost" onclick="run(() => setBooking(${b.id},'accepted'))">Accept</button>
+            <button class="ghost" onclick="run(() => setBooking(${b.id},'completed'))">Completed</button>
+            <button class="danger" onclick="run(() => setBooking(${b.id},'cancelled'))">Cancel</button>
+          </div>
+        </div>`).join("") || '<p class="muted">No requests yet.</p>'}
+    </section>`;
+}
+async function setMyLocation(useDemoLoc) {
+  if (useDemoLoc && !demo) throw new Error("Demo location not available");
+  const g = useDemoLoc ? { lat: demo.lat, lng: demo.lng } : await getGps();
+  await api(`/users/${me.id}/location`, "PATCH", g);
+  me.lat = g.lat; me.lng = g.lng;
+  localStorage.setItem("peddlo_user", JSON.stringify(me));
+  renderGigWorker();
+}
+async function addService() {
+  await api(`/gig/${me.id}/services`, "POST", { skill: val("gk"), rate: parseFloat(val("gr")), rate_unit: val("gu") });
+  renderGigWorker();
+}
+async function setBooking(id, status) {
+  await api(`/bookings/${id}/status`, "PATCH", { status });
+  renderGigWorker();
+}
+
+/* ---------------- start ---------------- */
+function start() {
+  if (!me) return renderLogin();
+  $("#who").innerHTML = `${esc(me.name)} <small>${esc(me.role)} · <a href="#" style="color:#fff" onclick="logout();return false;">log out</a></small>`;
+  run(me.role === "hawker" ? renderHawker : me.role === "gig" ? renderGigWorker : renderCustomer);
+}
+api("/config").then((c) => (demo = c)).catch(() => {}).finally(start);
+</script>
+</body>
+</html>
